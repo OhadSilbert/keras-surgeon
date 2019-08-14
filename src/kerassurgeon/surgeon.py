@@ -8,9 +8,6 @@ from keras.models import Model
 from kerassurgeon import utils
 from kerassurgeon.utils import get_inbound_nodes
 
-# Set up logging
-logging.basicConfig(level=logging.INFO)
-
 
 class Surgeon:
     """Performs network surgery on a model.
@@ -31,11 +28,12 @@ class Surgeon:
         copy: If True, the model will be copied before and after any operations
               This keeps the layers in the original model and the new model separate.
     """
-    def __init__(self, model, copy=None):
+    def __init__(self, model, copy=None, normalize_weight_vectors=False):
         if copy:
             self.model = utils.clean_copy(model)
         else:
             self.model = model
+        self._normalize_weight_vectors = normalize_weight_vectors
         self.nodes = []
         self._copy = copy
         self._finished_nodes = {}
@@ -398,7 +396,7 @@ class Surgeon:
             outbound_mask = np.reshape(inbound_masks, [-1, ])
             new_layer = layer
 
-        elif layer_class in ('Conv1D', 'Conv2D', 'Conv3D'):
+        elif layer_class in ('Conv1D', 'Conv2D', 'Conv3D', 'Conv2DTranspose', 'Conv3DTranspose'):
             if np.all(inbound_masks):
                 new_layer = layer
             else:
@@ -409,15 +407,23 @@ class Surgeon:
                 index = [slice(None, 1, None) for _ in k_size]
                 inbound_masks = inbound_masks[tuple(index + [slice(None)])]
                 weights = layer.get_weights()
+                if layer_class in ('Conv2DTranspose', 'Conv3DTranspose'):
+                    weights[0] = np.swapaxes(weights[0], -1, -2)
                 # Delete unused weights to obtain new_weights
                 # Each deleted channel was connected to all of the channels
                 # in layer; therefore, the mask must be repeated for each
                 # channel.
                 # `delete_mask`'s size: size(weights[0])
+                old_rank = np.prod(weights[0].shape[:-1])
                 delete_mask = np.tile(inbound_masks[..., np.newaxis], list(k_size) + [1, weights[0].shape[-1]])
                 new_shape = list(weights[0].shape)
                 new_shape[-2] = -1  # Weights always have channels_last
                 weights[0] = np.reshape(weights[0][delete_mask], new_shape)
+                new_rank = np.prod(weights[0].shape[:-1])
+                if self._normalize_weight_vectors:
+                    weights[0] *= np.sqrt(old_rank / new_rank)
+                if layer_class in ('Conv2DTranspose', 'Conv3DTranspose'):
+                    weights[0] = np.swapaxes(weights[0], -1, -2)
                 # Instantiate new layer with new_weights
                 config = layer.get_config()
                 config['weights'] = weights
@@ -638,6 +644,12 @@ class Surgeon:
             weights = [np.delete(w, channel_indices_lstm, axis=-1)
                        for w in layer.get_weights()]
             weights[1] = np.delete(weights[1], channel_indices, axis=0)
+        elif layer.__class__.__name__ == 'Conv3DTranspose' or layer.__class__.__name__ == 'Conv2DTranspose':
+            weights = layer.get_weights()
+            weights[0] = np.swapaxes(weights[0], -1, -2)
+            weights = [np.delete(w, channel_indices, axis=-1)
+                       for w in weights]
+            weights[0] = np.swapaxes(weights[0], -1, -2)
         else:
             weights = [np.delete(w, channel_indices, axis=-1)
                        for w in layer.get_weights()]
